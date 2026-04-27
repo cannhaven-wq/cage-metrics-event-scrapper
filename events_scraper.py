@@ -45,10 +45,11 @@ def get_soup(url):
         return None
 
 def extract_id_from_url(url):
-    """Extract the trailing UUID-like id from a ufcstats URL."""
+    """Extract the trailing UUID-like id from a ufcstats URL.
+    Matches event-details/<id>, fight-details/<id>, fighter-details/<id>."""
     if not url:
         return None
-    m = re.search(r"/details/([a-f0-9]+)", url)
+    m = re.search(r"-details/([a-f0-9]+)", url)
     return m.group(1) if m else None
 
 def parse_int(s):
