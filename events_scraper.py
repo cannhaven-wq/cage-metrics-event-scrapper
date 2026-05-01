@@ -91,27 +91,66 @@ def parse_event_date(s):
         return None
 
 # ---------- Fighter lookup cache ----------
-_fighter_cache = None
+_fighter_by_url = None
+_fighter_by_name = None
 
-def get_fighter_id(ufc_url):
-    """Look up fighter id in our DB by their ufc_url."""
-    global _fighter_cache
-    if _fighter_cache is None:
-        _fighter_cache = {}
-        # Pull all fighters in pages
-        from_idx = 0
-        while True:
-            res = supabase.table("fighters").select("id, ufc_url").range(from_idx, from_idx + 999).execute()
-            if not res.data:
-                break
-            for row in res.data:
-                if row.get("ufc_url"):
-                    _fighter_cache[row["ufc_url"]] = row["id"]
-            if len(res.data) < 1000:
-                break
-            from_idx += 1000
-        print(f"  Loaded {len(_fighter_cache)} fighters into cache.")
-    return _fighter_cache.get(ufc_url)
+def _url_variants(url):
+    """All scheme/host variants of a UFCStats fighter URL we want to match against."""
+    if not url:
+        return []
+    variants = {url}
+    # http/https
+    variants.add(url.replace("http://", "https://"))
+    variants.add(url.replace("https://", "http://"))
+    # with/without www.
+    for v in list(variants):
+        if "://www." in v:
+            variants.add(v.replace("://www.", "://"))
+        else:
+            variants.add(v.replace("://", "://www.", 1))
+    return list(variants)
+
+def _load_fighter_cache():
+    """Load every fighter into URL and name lookup dicts."""
+    global _fighter_by_url, _fighter_by_name
+    _fighter_by_url = {}
+    _fighter_by_name = {}
+    from_idx = 0
+    while True:
+        res = supabase.table("fighters").select("id, name, ufc_url").range(from_idx, from_idx + 999).execute()
+        if not res.data:
+            break
+        for row in res.data:
+            if row.get("ufc_url"):
+                for v in _url_variants(row["ufc_url"]):
+                    _fighter_by_url[v] = row["id"]
+            if row.get("name"):
+                key = row["name"].strip().lower()
+                # First-seen wins on name collisions; URL match should resolve those anyway.
+                if key not in _fighter_by_name:
+                    _fighter_by_name[key] = row["id"]
+        if len(res.data) < 1000:
+            break
+        from_idx += 1000
+    print(f"  Loaded fighter cache: {len(_fighter_by_name)} unique names, "
+          f"{len(_fighter_by_url)} URL variants.")
+
+def get_fighter_id(ufc_url, name=None):
+    """Look up fighter id by URL first, then by name as fallback."""
+    if _fighter_by_url is None:
+        _load_fighter_cache()
+    if ufc_url:
+        # Try the URL as-is, then all variants.
+        if ufc_url in _fighter_by_url:
+            return _fighter_by_url[ufc_url]
+        for v in _url_variants(ufc_url):
+            if v in _fighter_by_url:
+                return _fighter_by_url[v]
+    if name:
+        key = name.strip().lower()
+        if key in _fighter_by_name:
+            return _fighter_by_name[key]
+    return None
 
 # ---------- Event list ----------
 def get_event_urls(upcoming=False):
@@ -198,8 +237,8 @@ def parse_fight(url):
 
     fight["fighter_a_name"] = fighter_data[0]["name"]
     fight["fighter_b_name"] = fighter_data[1]["name"]
-    fight["fighter_a_id"] = get_fighter_id(fighter_data[0]["url"]) if fighter_data[0]["url"] else None
-    fight["fighter_b_id"] = get_fighter_id(fighter_data[1]["url"]) if fighter_data[1]["url"] else None
+    fight["fighter_a_id"] = get_fighter_id(fighter_data[0]["url"], fighter_data[0]["name"])
+    fight["fighter_b_id"] = get_fighter_id(fighter_data[1]["url"], fighter_data[1]["name"])
 
     # Determine winner from status W/L
     if fighter_data[0]["status"] == "W":
@@ -262,61 +301,59 @@ def parse_fight(url):
     return fight, rounds_data
 
 def parse_round_stats(soup, fighter_a_id, fighter_b_id):
-    """Parse the per-round stats tables on a fight page."""
+    """Parse the per-round stats tables on a fight page.
+
+    The page has two per-round tables, both with class `js-fight-table`:
+      - totals    : KD, Sig.str, Sig.str%, Total str, Td, Td%, Sub.att, Rev., Ctrl
+      - sig_strikes: Sig.str, Sig.str%, Head, Body, Leg, Distance, Clinch, Ground
+
+    Each table has alternating <thead "...row_type_head"> "Round N" rows
+    and <tr "...table-row"> data rows containing two <p> tags per <td>
+    (one for fighter A, one for fighter B).
+    """
     rounds = {}  # round_number -> dict
 
-    # Table 1: Totals (per round) — kd, sig str, total str, td, sub att, rev, ctrl
-    totals_section = soup.select_one("section.b-fight-details__section_collapse:nth-of-type(1)")
-    if not totals_section:
-        # Try alternative selectors
-        sections = soup.select("section.b-fight-details__section")
-    # Use a broader approach: find tables with class b-fight-details__table
-    tables = soup.select("table.b-fight-details__table")
+    per_round_tables = soup.select("table.js-fight-table")
 
-    # The page structure on ufcstats has: Totals (overall), Totals per round, Sig Strikes (overall), Sig Strikes per round
-    # Per-round tables are inside <section class="b-fight-details__section_collapse">
-    per_round_sections = soup.select("section.b-fight-details__section_collapse")
-
-    for section in per_round_sections:
-        # Determine which type of stats this is (totals or sig strikes)
-        # Check sibling header
-        section_type = None
-        prev = section.find_previous("h3", class_="b-fight-details__collapse-link_tot") or \
-               section.find_previous("a", class_="b-fight-details__collapse-link_tot")
-        # Heuristic: look at column headers
-        thead = section.select_one("thead.b-fight-details__table-head_rnd")
-        if thead:
-            headers_text = " ".join(th.get_text(strip=True).lower() for th in thead.select("th"))
-            if "kd" in headers_text and "td" in headers_text:
-                section_type = "totals"
-            elif "head" in headers_text and "body" in headers_text and "leg" in headers_text:
-                section_type = "sig_strikes"
-
-        if not section_type:
+    for table in per_round_tables:
+        # Determine table type from its column headers.
+        thead = table.select_one("thead.b-fight-details__table-head_rnd")
+        if not thead:
+            continue
+        headers_text = " ".join(th.get_text(strip=True).lower() for th in thead.select("th"))
+        if "kd" in headers_text and "ctrl" in headers_text:
+            section_type = "totals"
+        elif "head" in headers_text and "body" in headers_text and "leg" in headers_text:
+            section_type = "sig_strikes"
+        else:
             continue
 
-        # Each round is its own thead.b-fight-details__table-row_type_head + tbody section
-        # Actually the structure is: one table, multiple <tbody> alternating header rows and data rows
-        # Let's iterate all rows
+        # Walk the table body. Round headers are <thead "...row_type_head"> with a "Round N" label;
+        # data rows are <tr class="b-fight-details__table-row">. Note that the page uses <thead>
+        # tags inline as round-section dividers, which is non-standard markup but parseable.
         round_num = 0
-        for tr in section.select("tr.b-fight-details__table-row"):
-            classes = tr.get("class", [])
-            if "b-fight-details__table-row_type_head" in classes or tr.select_one("th.b-fight-details__table-col_style_grey-bg"):
-                # This is a "Round N" header row
-                txt = tr.get_text(strip=True)
-                m = re.search(r"Round\s*(\d+)", txt)
+        body = table.select_one("tbody") or table
+        for el in body.find_all(["thead", "tr"], recursive=True):
+            classes = el.get("class") or []
+            # Round-header row
+            if "b-fight-details__table-row_type_head" in classes:
+                m = re.search(r"Round\s*(\d+)", el.get_text(strip=True))
                 if m:
                     round_num = int(m.group(1))
                 continue
+            if el.name != "tr":
+                continue
+            if "b-fight-details__table-row" not in classes:
+                continue
             if round_num == 0:
                 continue
-            # Data row: 2 fighters' stats across columns
-            cols = tr.select("td.b-fight-details__table-col")
+
+            cols = el.select("td.b-fight-details__table-col")
             if not cols:
                 continue
-            # Each col has 2 <p> tags (one per fighter)
+
             def col_pair(col):
-                ps = col.select("p")
+                ps = col.select("p.b-fight-details__table-text")
                 if len(ps) >= 2:
                     return ps[0].get_text(strip=True), ps[1].get_text(strip=True)
                 return (None, None)
@@ -327,35 +364,39 @@ def parse_round_stats(soup, fighter_a_id, fighter_b_id):
                 "fighter_b_id": fighter_b_id,
             })
 
-            if section_type == "totals":
-                # Cols: Fighter, KD, Sig.str., Sig.str.%, Total str., Td, Td %, Sub.att., Rev., Ctrl
-                if len(cols) >= 10:
-                    a, b = col_pair(cols[1]); r["a_kd"], r["b_kd"] = parse_int(a), parse_int(b)
-                    a, b = col_pair(cols[2])
-                    al, at = parse_x_of_y(a); bl, bt = parse_x_of_y(b)
-                    r["a_sig_str_landed"], r["a_sig_str_attempted"] = al, at
-                    r["b_sig_str_landed"], r["b_sig_str_attempted"] = bl, bt
-                    a, b = col_pair(cols[4])
-                    al, at = parse_x_of_y(a); bl, bt = parse_x_of_y(b)
-                    r["a_total_str_landed"], r["a_total_str_attempted"] = al, at
-                    r["b_total_str_landed"], r["b_total_str_attempted"] = bl, bt
-                    a, b = col_pair(cols[5])
-                    al, at = parse_x_of_y(a); bl, bt = parse_x_of_y(b)
-                    r["a_td_landed"], r["a_td_attempted"] = al, at
-                    r["b_td_landed"], r["b_td_attempted"] = bl, bt
-                    a, b = col_pair(cols[7]); r["a_sub_attempts"], r["b_sub_attempts"] = parse_int(a), parse_int(b)
-                    a, b = col_pair(cols[8]); r["a_rev"], r["b_rev"] = parse_int(a), parse_int(b)
-                    a, b = col_pair(cols[9]); r["a_ctrl_seconds"], r["b_ctrl_seconds"] = parse_ctrl_time(a), parse_ctrl_time(b)
+            if section_type == "totals" and len(cols) >= 10:
+                # Cols: 0=Fighter, 1=KD, 2=Sig.str, 3=Sig.str%, 4=Total str, 5=Td, 6=Td%, 7=Sub.att, 8=Rev, 9=Ctrl
+                a, b = col_pair(cols[1]); r["a_kd"], r["b_kd"] = parse_int(a), parse_int(b)
+                a, b = col_pair(cols[2])
+                al, at = parse_x_of_y(a); bl, bt = parse_x_of_y(b)
+                r["a_sig_str_landed"], r["a_sig_str_attempted"] = al, at
+                r["b_sig_str_landed"], r["b_sig_str_attempted"] = bl, bt
+                a, b = col_pair(cols[4])
+                al, at = parse_x_of_y(a); bl, bt = parse_x_of_y(b)
+                r["a_total_str_landed"], r["a_total_str_attempted"] = al, at
+                r["b_total_str_landed"], r["b_total_str_attempted"] = bl, bt
+                a, b = col_pair(cols[5])
+                al, at = parse_x_of_y(a); bl, bt = parse_x_of_y(b)
+                r["a_td_landed"], r["a_td_attempted"] = al, at
+                r["b_td_landed"], r["b_td_attempted"] = bl, bt
+                a, b = col_pair(cols[7]); r["a_sub_attempts"], r["b_sub_attempts"] = parse_int(a), parse_int(b)
+                a, b = col_pair(cols[8]); r["a_rev"], r["b_rev"] = parse_int(a), parse_int(b)
+                a, b = col_pair(cols[9]); r["a_ctrl_seconds"], r["b_ctrl_seconds"] = parse_ctrl_time(a), parse_ctrl_time(b)
 
-            elif section_type == "sig_strikes":
-                # Cols: Fighter, Sig.str, Sig.str.%, Head, Body, Leg, Distance, Clinch, Ground
-                if len(cols) >= 9:
-                    a, b = col_pair(cols[3]); r["a_head_landed"], _ = parse_x_of_y(a); r["b_head_landed"], _ = parse_x_of_y(b)
-                    a, b = col_pair(cols[4]); r["a_body_landed"], _ = parse_x_of_y(a); r["b_body_landed"], _ = parse_x_of_y(b)
-                    a, b = col_pair(cols[5]); r["a_leg_landed"], _ = parse_x_of_y(a); r["b_leg_landed"], _ = parse_x_of_y(b)
-                    a, b = col_pair(cols[6]); r["a_distance_landed"], _ = parse_x_of_y(a); r["b_distance_landed"], _ = parse_x_of_y(b)
-                    a, b = col_pair(cols[7]); r["a_clinch_landed"], _ = parse_x_of_y(a); r["b_clinch_landed"], _ = parse_x_of_y(b)
-                    a, b = col_pair(cols[8]); r["a_ground_landed"], _ = parse_x_of_y(a); r["b_ground_landed"], _ = parse_x_of_y(b)
+            elif section_type == "sig_strikes" and len(cols) >= 9:
+                # Cols: 0=Fighter, 1=Sig.str, 2=Sig.str%, 3=Head, 4=Body, 5=Leg, 6=Distance, 7=Clinch, 8=Ground
+                a, b = col_pair(cols[3])
+                r["a_head_landed"], _ = parse_x_of_y(a); r["b_head_landed"], _ = parse_x_of_y(b)
+                a, b = col_pair(cols[4])
+                r["a_body_landed"], _ = parse_x_of_y(a); r["b_body_landed"], _ = parse_x_of_y(b)
+                a, b = col_pair(cols[5])
+                r["a_leg_landed"], _ = parse_x_of_y(a); r["b_leg_landed"], _ = parse_x_of_y(b)
+                a, b = col_pair(cols[6])
+                r["a_distance_landed"], _ = parse_x_of_y(a); r["b_distance_landed"], _ = parse_x_of_y(b)
+                a, b = col_pair(cols[7])
+                r["a_clinch_landed"], _ = parse_x_of_y(a); r["b_clinch_landed"], _ = parse_x_of_y(b)
+                a, b = col_pair(cols[8])
+                r["a_ground_landed"], _ = parse_x_of_y(a); r["b_ground_landed"], _ = parse_x_of_y(b)
 
             rounds[round_num] = r
 
