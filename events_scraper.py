@@ -19,11 +19,16 @@ import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
+from challenge import make_session, get as challenge_get, is_challenge
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
 RATE_LIMIT_SECONDS = 1.5
 HEADERS = {"User-Agent": "CageMetrics/1.0 (Personal UFC stats project)"}
+
+# Shared session that transparently solves UFCStats' proof-of-work
+# interstitial (see challenge.py). One session per run reuses the cookie.
+SESSION = make_session()
 
 # Scrape modes
 INCREMENTAL = os.environ.get("INCREMENTAL", "false").lower() == "true"  # if true, only upcoming + recent
@@ -37,8 +42,11 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 def get_soup(url):
     time.sleep(RATE_LIMIT_SECONDS)
     try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
+        r = challenge_get(SESSION, url, timeout=30)
         r.raise_for_status()
+        if is_challenge(r.text):
+            print(f"  ! Still challenged after solve attempts: {url}")
+            return None
         return BeautifulSoup(r.text, "html.parser")
     except Exception as e:
         print(f"  ! Error fetching {url}: {e}")

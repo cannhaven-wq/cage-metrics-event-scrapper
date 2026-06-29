@@ -45,6 +45,15 @@ import requests
 from datetime import datetime, date, timedelta
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
+from challenge import make_session, get as challenge_get
+
+# Status lines use unicode (→, ✓). On Windows the default console encoding
+# (cp1252) can't encode those and crashes mid-run; force UTF-8 stdout.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # =============================================================================
 # Config
@@ -54,6 +63,11 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
 RATE_LIMIT_SECONDS = 1.5
 HEADERS = {"User-Agent": "CannonFightLab/1.0 (Personal UFC stats project)"}
+
+# Shared HTTP session that transparently solves UFCStats' proof-of-work
+# interstitial (see challenge.py). One session per run so the clearance
+# cookie is reused across every request.
+SESSION = make_session()
 
 RECENT_EVENT_DAYS = int(os.environ.get("RECENT_EVENT_DAYS", "14"))
 RECENT_FIGHTER_DAYS = int(os.environ.get("RECENT_FIGHTER_DAYS", "14"))
@@ -80,11 +94,18 @@ STATS = {
 # =============================================================================
 
 def get_soup(url):
-    """Fetch a URL with rate limiting. Returns BeautifulSoup or None."""
+    """Fetch a URL with rate limiting. Returns BeautifulSoup or None.
+    Routes through the challenge-solving session so the UFCStats PoW
+    interstitial is handled transparently."""
     time.sleep(RATE_LIMIT_SECONDS)
     try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
+        r = challenge_get(SESSION, url, timeout=30)
         r.raise_for_status()
+        from challenge import is_challenge
+        if is_challenge(r.text):
+            print(f"  ! Still challenged after solve attempts: {url}")
+            STATS["errors"] += 1
+            return None
         return BeautifulSoup(r.text, "html.parser")
     except Exception as e:
         print(f"  ! Error fetching {url}: {e}")

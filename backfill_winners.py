@@ -39,11 +39,15 @@ import sys
 import requests
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
+from challenge import make_session, get as challenge_get
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
 RATE_LIMIT_SECONDS = 1.5
 HEADERS = {"User-Agent": "CageMetrics/1.0 (Personal UFC stats project)"}
+
+# Shared session that solves UFCStats' proof-of-work interstitial (challenge.py).
+SESSION = make_session()
 
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
     print("ERROR: Missing SUPABASE_URL or SUPABASE_SECRET_KEY env vars")
@@ -122,7 +126,7 @@ def get_winner_from_page(url, by_url, by_name):
     """
     time.sleep(RATE_LIMIT_SECONDS)
     try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
+        r = challenge_get(SESSION, url, timeout=30)
         r.raise_for_status()
     except Exception as e:
         print(f"  ! Fetch error: {e}")
