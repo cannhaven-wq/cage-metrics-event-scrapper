@@ -1,0 +1,7 @@
+# Railway's build image updated `mise` (>= 2026.06) to verify GitHub artifact
+# attestations when installing Python. The pinned python-build-standalone 3.11.9
+# (runtime.txt) predates attestations, so `mise install` fails with:
+#   "No GitHub artifact attestations found for python@3.11.9"
+# Disable that verification so the pinned Python installs and the build succeeds.
+[settings]
+python.github_attestations = false
