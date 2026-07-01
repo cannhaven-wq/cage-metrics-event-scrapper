@@ -863,6 +863,13 @@ def main():
     print(f"  Errors:                   {STATS['errors']}")
     print("=" * 64)
 
+    # The UFC always has announced upcoming cards, so a run that saw zero
+    # events means the scrape is broken (challenge regression, markup change,
+    # block) — exit non-zero so Railway shows the run as failed instead of
+    # letting the schedule quietly go stale.
+    if STATS["events_seen"] == 0:
+        raise SystemExit("Saw 0 events across all phases — scrape is broken, refusing to exit green")
+
 
 if __name__ == "__main__":
     main()
