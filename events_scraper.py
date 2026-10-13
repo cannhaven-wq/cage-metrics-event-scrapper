@@ -20,6 +20,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
 from challenge import make_session, get as challenge_get, is_challenge
+from promotion import tables_for, non_ufc_promotion, is_missing_table_error, UFC_TABLES, NON_UFC_TABLES
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
@@ -412,25 +413,41 @@ def parse_round_stats(soup, fighter_a_id, fighter_b_id):
 
 # ---------- Upserts ----------
 def upsert_event(event):
+    """Write the card to the UFC tables or, if it is not a UFC event, to the
+    *_non_ufc tables (T-086). Returns (event_id, tables) or (None, None).
+    A non-UFC card is NEVER written to `events`: if its tables are missing,
+    it is skipped."""
+    if not event.get("name"):
+        print(f"  ! Event has no name, cannot classify it, skipping: {event.get('ufc_url')}")
+        return None, None
+    tables = tables_for(event)
+    row = dict(event)
+    if tables is NON_UFC_TABLES:
+        row["promotion"] = non_ufc_promotion(event["name"])
+        print(f"  Not a UFC event ({row['promotion']}): {event['name']} -> {tables['events']}")
     try:
-        res = supabase.table("events").upsert(event, on_conflict="ufc_event_id").execute()
+        res = supabase.table(tables["events"]).upsert(row, on_conflict="ufc_event_id").execute()
         if res.data:
-            return res.data[0]["id"]
+            return res.data[0]["id"], tables
         # Look up if upsert didn't return id
-        existing = supabase.table("events").select("id").eq("ufc_event_id", event["ufc_event_id"]).execute()
+        existing = supabase.table(tables["events"]).select("id").eq("ufc_event_id", row["ufc_event_id"]).execute()
         if existing.data:
-            return existing.data[0]["id"]
-        return None
+            return existing.data[0]["id"], tables
+        return None, None
     except Exception as e:
+        if tables is NON_UFC_TABLES and is_missing_table_error(e):
+            print(f"  ! {tables['events']} does not exist yet (T-086 not applied); "
+                  f"skipping non-UFC card {event['name']}")
+            return None, None
         print(f"  ! Event upsert error: {e}")
-        return None
+        return None, None
 
-def upsert_fight(fight):
+def upsert_fight(fight, tables=UFC_TABLES):
     try:
-        res = supabase.table("fights").upsert(fight, on_conflict="ufc_fight_id").execute()
+        res = supabase.table(tables["fights"]).upsert(fight, on_conflict="ufc_fight_id").execute()
         if res.data:
             return res.data[0]["id"]
-        existing = supabase.table("fights").select("id").eq("ufc_fight_id", fight["ufc_fight_id"]).execute()
+        existing = supabase.table(tables["fights"]).select("id").eq("ufc_fight_id", fight["ufc_fight_id"]).execute()
         if existing.data:
             return existing.data[0]["id"]
         return None
@@ -438,15 +455,15 @@ def upsert_fight(fight):
         print(f"  ! Fight upsert error for {fight.get('ufc_fight_id')}: {e}")
         return None
 
-def upsert_rounds(fight_id, rounds):
+def upsert_rounds(fight_id, rounds, tables=UFC_TABLES):
     if not rounds or not fight_id:
         return
     # Delete existing rounds for this fight (clean slate), then insert
     try:
-        supabase.table("fight_rounds").delete().eq("fight_id", fight_id).execute()
+        supabase.table(tables["rounds"]).delete().eq("fight_id", fight_id).execute()
         rows = [{**r, "fight_id": fight_id} for r in rounds]
         if rows:
-            supabase.table("fight_rounds").insert(rows).execute()
+            supabase.table(tables["rounds"]).insert(rows).execute()
     except Exception as e:
         print(f"  ! Rounds upsert error for fight {fight_id}: {e}")
 
@@ -476,7 +493,7 @@ def main():
         event, fight_urls = parse_event(event_url, is_upcoming=is_upcoming)
         if not event:
             continue
-        event_db_id = upsert_event(event)
+        event_db_id, tables = upsert_event(event)
         if not event_db_id:
             print(f"  ! Could not save event, skipping fights")
             continue
@@ -489,9 +506,9 @@ def main():
             fight["event_id"] = event_db_id
             # First fight on the card by convention is the main event (top of card on ufcstats)
             fight["is_main_event"] = (f_idx == 1)
-            fight_id = upsert_fight(fight)
+            fight_id = upsert_fight(fight, tables)
             if fight_id and rounds:
-                upsert_rounds(fight_id, rounds)
+                upsert_rounds(fight_id, rounds, tables)
             fight_count += 1
             if fight_count % 25 == 0:
                 print(f"  ... {fight_count} fights processed total")

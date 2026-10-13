@@ -46,6 +46,7 @@ from datetime import datetime, date, timedelta
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
 from challenge import make_session, get as challenge_get
+from promotion import tables_for, non_ufc_promotion, is_missing_table_error, UFC_TABLES, NON_UFC_TABLES
 
 # Status lines use unicode (→, ✓). On Windows the default console encoding
 # (cp1252) can't encode those and crashes mid-run; force UTF-8 stdout.
@@ -630,25 +631,41 @@ def parse_round_stats(soup, fighter_a_id, fighter_b_id):
     return list(rounds.values())
 
 def upsert_event(event):
+    """Write the card to the UFC tables or, if it is not a UFC event, to the
+    *_non_ufc tables (T-086). Returns (event_id, tables) or (None, None).
+    A non-UFC card is NEVER written to `events`: if its tables are missing,
+    it is skipped."""
+    if not event.get("name"):
+        print(f"  ! Event has no name, cannot classify it, skipping: {event.get('ufc_url')}")
+        return None, None
+    tables = tables_for(event)
+    row = dict(event)
+    if tables is NON_UFC_TABLES:
+        row["promotion"] = non_ufc_promotion(event["name"])
+        print(f"  Not a UFC event ({row['promotion']}): {event['name']} -> {tables['events']}")
     try:
-        res = supabase.table("events").upsert(event, on_conflict="ufc_event_id").execute()
+        res = supabase.table(tables["events"]).upsert(row, on_conflict="ufc_event_id").execute()
         if res.data:
-            return res.data[0]["id"]
-        existing = supabase.table("events").select("id").eq("ufc_event_id", event["ufc_event_id"]).execute()
+            return res.data[0]["id"], tables
+        existing = supabase.table(tables["events"]).select("id").eq("ufc_event_id", row["ufc_event_id"]).execute()
         if existing.data:
-            return existing.data[0]["id"]
-        return None
+            return existing.data[0]["id"], tables
+        return None, None
     except Exception as e:
+        if tables is NON_UFC_TABLES and is_missing_table_error(e):
+            print(f"  ! {tables['events']} does not exist yet (T-086 not applied); "
+                  f"skipping non-UFC card {event['name']}")
+            return None, None
         print(f"  ! Event upsert error: {e}")
         STATS["errors"] += 1
-        return None
+        return None, None
 
-def upsert_fight(fight):
+def upsert_fight(fight, tables=UFC_TABLES):
     try:
-        res = supabase.table("fights").upsert(fight, on_conflict="ufc_fight_id").execute()
+        res = supabase.table(tables["fights"]).upsert(fight, on_conflict="ufc_fight_id").execute()
         if res.data:
             return res.data[0]["id"]
-        existing = supabase.table("fights").select("id").eq("ufc_fight_id", fight["ufc_fight_id"]).execute()
+        existing = supabase.table(tables["fights"]).select("id").eq("ufc_fight_id", fight["ufc_fight_id"]).execute()
         if existing.data:
             return existing.data[0]["id"]
         return None
@@ -657,14 +674,14 @@ def upsert_fight(fight):
         STATS["errors"] += 1
         return None
 
-def upsert_rounds(fight_id, rounds):
+def upsert_rounds(fight_id, rounds, tables=UFC_TABLES):
     if not rounds or not fight_id:
         return
     try:
-        supabase.table("fight_rounds").delete().eq("fight_id", fight_id).execute()
+        supabase.table(tables["rounds"]).delete().eq("fight_id", fight_id).execute()
         rows = [{**r, "fight_id": fight_id} for r in rounds]
         if rows:
-            supabase.table("fight_rounds").insert(rows).execute()
+            supabase.table(tables["rounds"]).insert(rows).execute()
     except Exception as e:
         print(f"  ! Rounds upsert error for fight {fight_id}: {e}")
         STATS["errors"] += 1
@@ -686,7 +703,7 @@ def phase_1_upcoming_events():
         if not event:
             continue
         STATS["events_seen"] += 1
-        event_db_id = upsert_event(event)
+        event_db_id, tables = upsert_event(event)
         if not event_db_id:
             continue
         STATS["events_upserted"] += 1
@@ -697,10 +714,10 @@ def phase_1_upcoming_events():
                 continue
             fight["event_id"] = event_db_id
             fight["is_main_event"] = (f_idx == 1)
-            fight_id = upsert_fight(fight)
+            fight_id = upsert_fight(fight, tables)
             STATS["fights_upserted"] += 1
             if fight_id and rounds:
-                upsert_rounds(fight_id, rounds)
+                upsert_rounds(fight_id, rounds, tables)
 
 
 def phase_2_recent_completed_events():
@@ -722,6 +739,18 @@ def phase_2_recent_completed_events():
                  .lt("event_date", date.today().isoformat())
                  .execute())
     targets.extend(stale_res.data or [])
+    # Non-UFC cards (T-086) need their results too. Re-scraping one routes it
+    # back to events_non_ufc by name, never to `events`.
+    try:
+        nu = (supabase.table(NON_UFC_TABLES["events"])
+              .select("id, ufc_url, event_date")
+              .gte("event_date", cutoff)
+              .lt("event_date", date.today().isoformat())
+              .execute())
+        targets.extend(nu.data or [])
+    except Exception as e:
+        if not is_missing_table_error(e):
+            raise
     print(f"  {len(targets)} events to refresh")
     for ev_idx, ev in enumerate(targets, 1):
         print(f"\n  [{ev_idx}/{len(targets)}] {ev['ufc_url']} ({ev.get('event_date')})")
@@ -729,7 +758,7 @@ def phase_2_recent_completed_events():
         if not event:
             continue
         STATS["events_seen"] += 1
-        event_db_id = upsert_event(event)
+        event_db_id, tables = upsert_event(event)
         if not event_db_id:
             continue
         STATS["events_upserted"] += 1
@@ -739,10 +768,10 @@ def phase_2_recent_completed_events():
                 continue
             fight["event_id"] = event_db_id
             fight["is_main_event"] = (f_idx == 1)
-            fight_id = upsert_fight(fight)
+            fight_id = upsert_fight(fight, tables)
             STATS["fights_upserted"] += 1
             if fight_id and rounds:
-                upsert_rounds(fight_id, rounds)
+                upsert_rounds(fight_id, rounds, tables)
 
 
 def phase_3_resolve_null_fighters():
