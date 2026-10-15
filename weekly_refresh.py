@@ -49,6 +49,7 @@ from bs4 import BeautifulSoup
 from supabase import create_client, Client
 from challenge import make_session, get as challenge_get
 from promotion import tables_for, non_ufc_promotion, is_missing_table_error, UFC_TABLES, NON_UFC_TABLES
+from rounds_writer import replace_rounds, RoundsWriteError
 
 # Status lines use unicode (→, ✓). On Windows the default console encoding
 # (cp1252) can't encode those and crashes mid-run; force UTF-8 stdout.
@@ -99,6 +100,7 @@ STATS = {
     "rounds_repaired": 0,
     "rounds_source_empty": 0,
     "rounds_fetch_failed": 0,
+    "rounds_write_failed": 0,
     "errors": 0,
 }
 
@@ -698,22 +700,19 @@ def upsert_fight(fight, tables=UFC_TABLES):
 def upsert_rounds(fight_id, rounds, tables=UFC_TABLES):
     """Write the round rows for one fight. Returns True when they are stored.
 
-    Upsert first, prune second. This used to delete every round and then
-    insert, so an insert that failed left the fight with NO rounds and only a
-    log line to show for it — the likely way UFC fight 7349 lost its rounds
-    while keeping its fight totals. Now a failed write leaves the previous
-    rows in place, and only rounds the source no longer lists are removed,
-    after the new ones are safely stored."""
+    One database transaction (rounds_writer.replace_rounds): the old rounds
+    are replaced by the new set, or kept exactly as they were. This used to
+    delete and then insert as two requests, which is how UFC fight 7349 lost
+    its rounds while keeping its fight totals. A failure is counted in
+    rounds_write_failed, and any count above zero fails the run."""
     if not rounds or not fight_id:
         return False
-    rows = [{**r, "fight_id": fight_id} for r in rounds]
     try:
-        supabase.table(tables["rounds"]).upsert(rows, on_conflict="fight_id,round_number").execute()
-        max_round = max(r["round_number"] for r in rows)
-        supabase.table(tables["rounds"]).delete().eq("fight_id", fight_id).gt("round_number", max_round).execute()
+        replace_rounds(supabase, tables["rounds"], fight_id, rounds)
         return True
-    except Exception as e:
-        print(f"  ! Rounds upsert error for fight {fight_id}: {e}")
+    except RoundsWriteError as e:
+        print(f"  ! Rounds write FAILED for fight {fight_id}: {e}")
+        STATS["rounds_write_failed"] += 1
         STATS["errors"] += 1
         return False
 
@@ -967,10 +966,11 @@ def phase_5_repair_missing_rounds():
         return
     print(f"  {len(targets)} completed fights have no round records")
     key = {"repaired": "rounds_repaired", "source_empty": "rounds_source_empty",
-           "fetch_failed": "rounds_fetch_failed", "write_failed": "rounds_fetch_failed"}
+           "fetch_failed": "rounds_fetch_failed", "write_failed": None}
     for f in targets[:REPAIR_MAX_FIGHTS]:
         outcome = repair_fight(f)
-        STATS[key[outcome]] += 1
+        if key[outcome]:  # write_failed is already counted by upsert_rounds
+            STATS[key[outcome]] += 1
         print(f"  fight {f['id']}: {outcome.upper()} {f['ufc_url']}")
 
 
@@ -1003,7 +1003,8 @@ def main():
     print(f"  Completed, no round stats:{STATS['completed_without_rounds']}")
     print(f"  Rounds repaired:          {STATS['rounds_repaired']}")
     print(f"  Rounds absent at source:  {STATS['rounds_source_empty']}")
-    print(f"  Rounds fetch/write failed:{STATS['rounds_fetch_failed']}")
+    print(f"  Rounds fetch failed:      {STATS['rounds_fetch_failed']}")
+    print(f"  Rounds WRITE failed:      {STATS['rounds_write_failed']}")
     print(f"  Errors:                   {STATS['errors']}")
     print("=" * 64)
 
@@ -1013,6 +1014,11 @@ def main():
     # letting the schedule quietly go stale.
     if STATS["events_seen"] == 0:
         raise SystemExit("Saw 0 events across all phases — scrape is broken, refusing to exit green")
+    # A run that could not store a fight's rounds is not a successful run,
+    # however much else it wrote.
+    if STATS["rounds_write_failed"]:
+        raise SystemExit(f"{STATS['rounds_write_failed']} fight(s) had round writes fail — "
+                         "their previous rounds are untouched; refusing to exit green")
 
 
 if __name__ == "__main__":

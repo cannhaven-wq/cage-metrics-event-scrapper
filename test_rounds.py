@@ -22,24 +22,34 @@ class Rounds(unittest.TestCase):
         self.wr = test_promotion.load("weekly_refresh", self.rec)
         self.wr.time.sleep = lambda *_a: None
 
-    def test_upsert_before_prune(self):
+    def test_rounds_go_through_the_one_transaction_function(self):
         ok = self.wr.upsert_rounds(7, [{"round_number": 1}, {"round_number": 2}])
         self.assertTrue(ok)
-        ops = [op for _t, op, _p in self.rec.calls if _t == "fight_rounds"]
-        self.assertEqual(ops[0], "upsert", "rounds must be written before anything is deleted")
-        self.assertNotIn("insert", ops)
+        self.assertEqual([(t, op) for t, op, _p in self.rec.calls], [("replace_fight_rounds", "rpc")],
+                         "rounds must never be written as separate delete / insert requests")
 
-    def test_failed_write_deletes_nothing(self):
-        class Boom:
-            def table(self, name):
-                q = types.SimpleNamespace()
-                def fail(*_a, **_k):
-                    raise RuntimeError("write refused")
-                q.upsert = fail
-                q.delete = lambda: (_ for _ in ()).throw(AssertionError("deleted after a failed write"))
-                return q
-        self.wr.supabase = Boom()
+    def test_failed_write_is_counted_and_fails_the_run(self):
+        self.rec.missing = {"replace_fight_rounds"}
         self.assertFalse(self.wr.upsert_rounds(7, [{"round_number": 1}]))
+        self.assertEqual(self.wr.STATS["rounds_write_failed"], 1)
+        self.assertNotIn("delete", [op for _t, op, _p in self.rec.calls], "no fallback to delete-then-insert")
+        for name in ("phase_1_upcoming_events", "phase_2_recent_completed_events", "phase_3_resolve_null_fighters",
+                     "phase_4_refresh_recent_fighters", "phase_5_repair_missing_rounds", "_load_fighter_cache"):
+            setattr(self.wr, name, lambda: None)
+        self.wr.STATS["events_seen"] = 5
+        with self.assertRaises(SystemExit) as cm:
+            self.wr.main()
+        self.assertIn("round writes fail", str(cm.exception))
+
+    def test_events_scraper_fails_the_run_too(self):
+        rec = test_promotion.Recorder()
+        rec.missing = {"replace_fight_rounds"}
+        es = test_promotion.load("events_scraper", rec)
+        self.assertFalse(es.upsert_rounds(7, [{"round_number": 1}]))
+        self.assertEqual(es.ROUND_WRITE_FAILURES, [7])
+        es.get_event_urls = lambda upcoming: []
+        with self.assertRaises(SystemExit):
+            es.main()
 
     def test_repair_classifies(self):
         f = {"id": 7349, "event_id": 1, "ufc_url": "u"}

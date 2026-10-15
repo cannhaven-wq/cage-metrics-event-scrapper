@@ -96,6 +96,20 @@ class Recorder:
 
         return Q()
 
+    def rpc(self, fn, params):
+        """The round-replacement functions: recorded under the function name,
+        and they answer with the number of rows stored, as Postgres does."""
+        rec = self
+
+        class R:
+            def execute(self):
+                rec.calls.append((fn, "rpc", params))
+                if fn in rec.missing:
+                    raise MissingTable({"code": "PGRST202", "message": f"Could not find the function public.{fn}"})
+                return types.SimpleNamespace(data=len(params["p_rounds"]))
+
+        return R()
+
 
 def load(module_name, recorder):
     fake = types.ModuleType("supabase")
@@ -140,13 +154,13 @@ class TestRouting(unittest.TestCase):
                 rec, eid = self.run_card(module_name, "UFC Fight Night: Buckley vs. Malott")
                 self.assertTrue(eid)
                 touched = {t for t, _op, _p in rec.calls}
-                self.assertEqual(touched, {"events", "fights", "fight_rounds"})
+                self.assertEqual(touched, {"events", "fights", "replace_fight_rounds"})
 
             with self.subTest(scraper=module_name, case="DWCS, tables present"):
                 rec, eid = self.run_card(module_name, "DWCS 10.3")
                 self.assertTrue(eid)
                 touched = {t for t, _op, _p in rec.calls}
-                self.assertEqual(touched, {"events_non_ufc", "fights_non_ufc", "fight_rounds_non_ufc"})
+                self.assertEqual(touched, {"events_non_ufc", "fights_non_ufc", "replace_fight_rounds_non_ufc"})
                 payload = next(p for t, op, p in rec.calls if t == "events_non_ufc" and op == "upsert")
                 self.assertEqual(payload["promotion"], "DWCS")
 
@@ -158,6 +172,7 @@ class TestRouting(unittest.TestCase):
                 self.assertNotIn("events", touched)
                 self.assertNotIn("fights", touched)
                 self.assertNotIn("fight_rounds", touched)
+                self.assertNotIn("replace_fight_rounds", touched)
 
             with self.subTest(scraper=module_name, case="no name"):
                 rec, eid = self.run_card(module_name, None)
