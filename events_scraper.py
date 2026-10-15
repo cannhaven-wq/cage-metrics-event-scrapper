@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 from supabase import create_client, Client
 from challenge import make_session, get as challenge_get, is_challenge
 from promotion import tables_for, non_ufc_promotion, is_missing_table_error, UFC_TABLES, NON_UFC_TABLES
+from rounds_writer import replace_rounds, RoundsWriteError
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
@@ -455,18 +456,22 @@ def upsert_fight(fight, tables=UFC_TABLES):
         print(f"  ! Fight upsert error for {fight.get('ufc_fight_id')}: {e}")
         return None
 
+ROUND_WRITE_FAILURES = []
+
+
 def upsert_rounds(fight_id, rounds, tables=UFC_TABLES):
+    """Replace one fight's rounds in a single transaction. Returns True when
+    stored. A failure leaves the old rounds exactly as they were, is recorded
+    in ROUND_WRITE_FAILURES, and fails the run (see weekly_refresh.upsert_rounds)."""
     if not rounds or not fight_id:
-        return
-    # Upsert first, prune second: a failed write must not leave the fight with
-    # no rounds (see weekly_refresh.upsert_rounds).
+        return False
     try:
-        rows = [{**r, "fight_id": fight_id} for r in rounds]
-        supabase.table(tables["rounds"]).upsert(rows, on_conflict="fight_id,round_number").execute()
-        max_round = max(r["round_number"] for r in rows)
-        supabase.table(tables["rounds"]).delete().eq("fight_id", fight_id).gt("round_number", max_round).execute()
-    except Exception as e:
-        print(f"  ! Rounds upsert error for fight {fight_id}: {e}")
+        replace_rounds(supabase, tables["rounds"], fight_id, rounds)
+        return True
+    except RoundsWriteError as e:
+        print(f"  ! Rounds write FAILED for fight {fight_id}: {e}")
+        ROUND_WRITE_FAILURES.append(fight_id)
+        return False
 
 # ---------- Main ----------
 def main():
@@ -515,6 +520,9 @@ def main():
                 print(f"  ... {fight_count} fights processed total")
 
     print(f"\n=== Done. {fight_count} fights saved. ===")
+    if ROUND_WRITE_FAILURES:
+        print(f"  Rounds WRITE failed for {len(ROUND_WRITE_FAILURES)} fight(s): {ROUND_WRITE_FAILURES}")
+        raise SystemExit("Round writes failed; previous rounds are untouched. Refusing to exit green.")
 
 if __name__ == "__main__":
     main()
