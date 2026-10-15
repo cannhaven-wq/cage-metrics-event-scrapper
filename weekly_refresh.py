@@ -99,6 +99,7 @@ STATS = {
     "rounds_repaired": 0,
     "rounds_source_empty": 0,
     "rounds_fetch_failed": 0,
+    "rounds_duplicate_booking": 0,
     "errors": 0,
 }
 
@@ -921,15 +922,31 @@ def fights_missing_rounds():
     past_events = {e["id"] for e in _page_all(lambda: supabase.table("events")
                    .select("id").lt("event_date", today).order("id"))}
     fights = _page_all(lambda: supabase.table("fights")
-                       .select("id, event_id, ufc_url, method, winner_id")
+                       .select("id, event_id, ufc_url, method, winner_id, fighter_a_id, fighter_b_id")
                        .order("id"))
     have = {r["fight_id"] for r in _page_all(lambda: supabase.table("fight_rounds")
             .select("fight_id").order("id"))}
-    return [f for f in fights
-            if f["event_id"] in past_events
-            and (f.get("method") or f.get("winner_id"))
-            and f["id"] not in have
-            and f.get("ufc_url")]
+    # A second row for the same two fighters on the same card is a stale
+    # duplicate booking, not a fight missing its stats (fights 43, 46 and 8780
+    # duplicate 27872, 27877 and 27879). Filling it would count the bout twice
+    # in every round-based view, so it is reported and never repaired.
+    pair = lambda f: (f["event_id"], frozenset((f.get("fighter_a_id"), f.get("fighter_b_id"))))
+    booked = {}
+    for f in fights:
+        if f.get("fighter_a_id") and f.get("fighter_b_id"):
+            booked.setdefault(pair(f), []).append(f["id"])
+    out = []
+    for f in fights:
+        if not (f["event_id"] in past_events and (f.get("method") or f.get("winner_id"))
+                and f["id"] not in have and f.get("ufc_url")):
+            continue
+        twins = [i for i in booked.get(pair(f), []) if i != f["id"]] if f.get("fighter_a_id") and f.get("fighter_b_id") else []
+        if twins:
+            print(f"  ! fight {f['id']} duplicates fight(s) {twins} on the same card; not repaired")
+            STATS["rounds_duplicate_booking"] += 1
+            continue
+        out.append(f)
+    return out
 
 
 def repair_fight(f):
@@ -1004,6 +1021,7 @@ def main():
     print(f"  Rounds repaired:          {STATS['rounds_repaired']}")
     print(f"  Rounds absent at source:  {STATS['rounds_source_empty']}")
     print(f"  Rounds fetch/write failed:{STATS['rounds_fetch_failed']}")
+    print(f"  Duplicate bookings skipped:{STATS['rounds_duplicate_booking']}")
     print(f"  Errors:                   {STATS['errors']}")
     print("=" * 64)
 

@@ -82,6 +82,29 @@ class Rounds(unittest.TestCase):
         got = [f["id"] for f in self.wr.fights_missing_rounds()]
         self.assertEqual(got, [11], "only a completed fight on a past card with no rounds")
 
+    def test_duplicate_booking_is_never_repaired(self):
+        data = {
+            "events": [{"id": 1}],
+            "fights": [
+                {"id": 43, "event_id": 1, "ufc_url": "old", "method": "Decision", "winner_id": 5,
+                 "fighter_a_id": 5, "fighter_b_id": 6},
+                {"id": 27872, "event_id": 1, "ufc_url": "new", "method": "Decision", "winner_id": 5,
+                 "fighter_a_id": 6, "fighter_b_id": 5},
+            ],
+            "fight_rounds": [{"fight_id": 27872}],
+        }
+        class DB:
+            def table(self, name):
+                class Q:
+                    def __getattr__(self, _n):
+                        return lambda *_a, **_k: self
+                    def execute(self):
+                        return types.SimpleNamespace(data=data[name])
+                return Q()
+        self.wr.supabase = DB()
+        self.assertEqual(self.wr.fights_missing_rounds(), [])
+        self.assertEqual(self.wr.STATS["rounds_duplicate_booking"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
