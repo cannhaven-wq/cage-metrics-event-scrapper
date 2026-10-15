@@ -458,12 +458,13 @@ def upsert_fight(fight, tables=UFC_TABLES):
 def upsert_rounds(fight_id, rounds, tables=UFC_TABLES):
     if not rounds or not fight_id:
         return
-    # Delete existing rounds for this fight (clean slate), then insert
+    # Upsert first, prune second: a failed write must not leave the fight with
+    # no rounds (see weekly_refresh.upsert_rounds).
     try:
-        supabase.table(tables["rounds"]).delete().eq("fight_id", fight_id).execute()
         rows = [{**r, "fight_id": fight_id} for r in rounds]
-        if rows:
-            supabase.table(tables["rounds"]).insert(rows).execute()
+        supabase.table(tables["rounds"]).upsert(rows, on_conflict="fight_id,round_number").execute()
+        max_round = max(r["round_number"] for r in rows)
+        supabase.table(tables["rounds"]).delete().eq("fight_id", fight_id).gt("round_number", max_round).execute()
     except Exception as e:
         print(f"  ! Rounds upsert error for fight {fight_id}: {e}")
 
