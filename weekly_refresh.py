@@ -16,6 +16,8 @@ PHASES (in order):
      just changed (new record, new last_fight_date, new career averages).
   5. Resolve any NULL fighter_a_id / fighter_b_id rows in fights table
      using the now-fresh fighter cache.
+  6. (phase_5_repair_missing_rounds) Re-scrape completed fights that hold no
+     round records, and classify each: repaired / absent at source / failed.
 
 What this DOES NOT do:
   - Re-scrape the full 4,488-fighter roster (use scraper.py for that)
@@ -72,6 +74,13 @@ SESSION = make_session()
 
 RECENT_EVENT_DAYS = int(os.environ.get("RECENT_EVENT_DAYS", "14"))
 RECENT_FIGHTER_DAYS = int(os.environ.get("RECENT_FIGHTER_DAYS", "14"))
+# Phase 5 re-scrapes at most this many completed fights per run that hold a
+# result but no round records. UFCStats sometimes posts results before stats,
+# and phase 2 stops looking after RECENT_EVENT_DAYS, so without this a fight
+# scraped too early kept no rounds forever (UFC Fight Night: Song vs.
+# Figueiredo, 2026-05-30, three bouts).
+REPAIR_MAX_FIGHTS = int(os.environ.get("REPAIR_MAX_FIGHTS", "60"))
+FETCH_ATTEMPTS = 3
 
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
     raise SystemExit("Missing SUPABASE_URL or SUPABASE_SECRET_KEY environment variables")
@@ -86,6 +95,10 @@ STATS = {
     "fighters_lazy_fetched": 0,
     "fighters_refreshed": 0,
     "null_fighters_resolved": 0,
+    "completed_without_rounds": 0,
+    "rounds_repaired": 0,
+    "rounds_source_empty": 0,
+    "rounds_fetch_failed": 0,
     "errors": 0,
 }
 
@@ -98,20 +111,28 @@ def get_soup(url):
     """Fetch a URL with rate limiting. Returns BeautifulSoup or None.
     Routes through the challenge-solving session so the UFCStats PoW
     interstitial is handled transparently."""
-    time.sleep(RATE_LIMIT_SECONDS)
-    try:
-        r = challenge_get(SESSION, url, timeout=30)
-        r.raise_for_status()
-        from challenge import is_challenge
-        if is_challenge(r.text):
-            print(f"  ! Still challenged after solve attempts: {url}")
-            STATS["errors"] += 1
-            return None
-        return BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
-        print(f"  ! Error fetching {url}: {e}")
-        STATS["errors"] += 1
-        return None
+    from challenge import is_challenge
+    last = None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        # Back off a little more on each retry; the first try keeps the
+        # normal rate limit.
+        time.sleep(RATE_LIMIT_SECONDS * attempt)
+        try:
+            r = challenge_get(SESSION, url, timeout=30)
+            # A 404 is an answer, not a transient failure: do not retry it.
+            if r.status_code == 404:
+                last = "HTTP 404"
+                break
+            r.raise_for_status()
+            if is_challenge(r.text):
+                last = "still challenged after solve attempts"
+                continue
+            return BeautifulSoup(r.text, "html.parser")
+        except Exception as e:
+            last = str(e)
+    print(f"  ! Error fetching {url} after {FETCH_ATTEMPTS} attempts: {last}")
+    STATS["errors"] += 1
+    return None
 
 
 # =============================================================================
@@ -675,16 +696,33 @@ def upsert_fight(fight, tables=UFC_TABLES):
         return None
 
 def upsert_rounds(fight_id, rounds, tables=UFC_TABLES):
+    """Write the round rows for one fight. Returns True when they are stored.
+
+    Upsert first, prune second. This used to delete every round and then
+    insert, so an insert that failed left the fight with NO rounds and only a
+    log line to show for it — the likely way UFC fight 7349 lost its rounds
+    while keeping its fight totals. Now a failed write leaves the previous
+    rows in place, and only rounds the source no longer lists are removed,
+    after the new ones are safely stored."""
     if not rounds or not fight_id:
-        return
+        return False
+    rows = [{**r, "fight_id": fight_id} for r in rounds]
     try:
-        supabase.table(tables["rounds"]).delete().eq("fight_id", fight_id).execute()
-        rows = [{**r, "fight_id": fight_id} for r in rounds]
-        if rows:
-            supabase.table(tables["rounds"]).insert(rows).execute()
+        supabase.table(tables["rounds"]).upsert(rows, on_conflict="fight_id,round_number").execute()
+        max_round = max(r["round_number"] for r in rows)
+        supabase.table(tables["rounds"]).delete().eq("fight_id", fight_id).gt("round_number", max_round).execute()
+        return True
     except Exception as e:
         print(f"  ! Rounds upsert error for fight {fight_id}: {e}")
         STATS["errors"] += 1
+        return False
+
+
+def note_missing_rounds(fight, fight_url):
+    """A fight with a result but no round tables is never skipped in silence."""
+    if fight.get("method") or fight.get("winner_id"):
+        print(f"  ! Completed fight has no round stats on the source page: {fight_url}")
+        STATS["completed_without_rounds"] += 1
 
 
 # =============================================================================
@@ -772,6 +810,8 @@ def phase_2_recent_completed_events():
             STATS["fights_upserted"] += 1
             if fight_id and rounds:
                 upsert_rounds(fight_id, rounds, tables)
+            elif fight_id:
+                note_missing_rounds(fight, fight_url)
 
 
 def phase_3_resolve_null_fighters():
@@ -864,6 +904,76 @@ def phase_4_refresh_recent_fighters():
 # Main
 # =============================================================================
 
+def _page_all(build, page=1000):
+    """Read every row of a PostgREST query, `page` rows at a time."""
+    out, start = [], 0
+    while True:
+        rows = build().range(start, start + page - 1).execute().data or []
+        out.extend(rows)
+        if len(rows) < page:
+            return out
+        start += page
+
+
+def fights_missing_rounds():
+    """Completed UFC fights from past cards that hold no round records."""
+    today = date.today().isoformat()
+    past_events = {e["id"] for e in _page_all(lambda: supabase.table("events")
+                   .select("id").lt("event_date", today).order("id"))}
+    fights = _page_all(lambda: supabase.table("fights")
+                       .select("id, event_id, ufc_url, method, winner_id")
+                       .order("id"))
+    have = {r["fight_id"] for r in _page_all(lambda: supabase.table("fight_rounds")
+            .select("fight_id").order("id"))}
+    return [f for f in fights
+            if f["event_id"] in past_events
+            and (f.get("method") or f.get("winner_id"))
+            and f["id"] not in have
+            and f.get("ufc_url")]
+
+
+def repair_fight(f):
+    """Re-scrape one fight that has a result but no rounds. Returns one of
+    'repaired', 'source_empty', 'fetch_failed', 'write_failed'.
+
+    Only what the source page states is written. Keys the parse could not
+    fill are dropped rather than sent as NULL, so a repair never erases a
+    value already on record; event_id is the one the fight already has."""
+    fight, rounds = parse_fight(f["ufc_url"])
+    if not fight:
+        return "fetch_failed"
+    if not rounds:
+        return "source_empty"
+    row = {k: v for k, v in fight.items() if v is not None}
+    row["event_id"] = f["event_id"]
+    fight_id = upsert_fight(row)
+    if not fight_id or not upsert_rounds(fight_id, rounds):
+        return "write_failed"
+    return "repaired"
+
+
+def phase_5_repair_missing_rounds():
+    """Completed fights with no round records: re-scrape and classify each.
+
+    Nothing is estimated. A fight whose UFCStats page carries no round
+    tables is reported as source_empty and left as it is; downstream
+    analytics already read a fight with no rounds as 'no data'."""
+    print(f"\n[PHASE 5] Completed fights without round records (max {REPAIR_MAX_FIGHTS})...")
+    try:
+        targets = fights_missing_rounds()
+    except Exception as e:
+        print(f"  ! Could not list fights without rounds: {e}")
+        STATS["errors"] += 1
+        return
+    print(f"  {len(targets)} completed fights have no round records")
+    key = {"repaired": "rounds_repaired", "source_empty": "rounds_source_empty",
+           "fetch_failed": "rounds_fetch_failed", "write_failed": "rounds_fetch_failed"}
+    for f in targets[:REPAIR_MAX_FIGHTS]:
+        outcome = repair_fight(f)
+        STATS[key[outcome]] += 1
+        print(f"  fight {f['id']}: {outcome.upper()} {f['ufc_url']}")
+
+
 def main():
     print("=" * 64)
     print("CFL Weekly Refresh")
@@ -876,6 +986,7 @@ def main():
     phase_2_recent_completed_events()
     phase_3_resolve_null_fighters()
     phase_4_refresh_recent_fighters()
+    phase_5_repair_missing_rounds()
 
     elapsed_min = (time.time() - started) / 60
     print()
@@ -889,6 +1000,10 @@ def main():
     print(f"  Fighters lazy-fetched:    {STATS['fighters_lazy_fetched']}")
     print(f"  Fighters refreshed:       {STATS['fighters_refreshed']}")
     print(f"  Null fighter ids resolved:{STATS['null_fighters_resolved']}")
+    print(f"  Completed, no round stats:{STATS['completed_without_rounds']}")
+    print(f"  Rounds repaired:          {STATS['rounds_repaired']}")
+    print(f"  Rounds absent at source:  {STATS['rounds_source_empty']}")
+    print(f"  Rounds fetch/write failed:{STATS['rounds_fetch_failed']}")
     print(f"  Errors:                   {STATS['errors']}")
     print("=" * 64)
 
