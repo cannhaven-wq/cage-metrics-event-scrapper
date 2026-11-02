@@ -49,6 +49,7 @@ from bs4 import BeautifulSoup
 from supabase import create_client, Client
 from challenge import make_session, get as challenge_get
 from promotion import tables_for, non_ufc_promotion, is_missing_table_error, UFC_TABLES, NON_UFC_TABLES
+from card_sync import retire_dropped_bouts
 
 # Status lines use unicode (→, ✓). On Windows the default console encoding
 # (cp1252) can't encode those and crashes mid-run; force UTF-8 stdout.
@@ -92,6 +93,7 @@ STATS = {
     "events_seen": 0,
     "events_upserted": 0,
     "fights_upserted": 0,
+    "bouts_retired": 0,
     "fighters_lazy_fetched": 0,
     "fighters_refreshed": 0,
     "null_fighters_resolved": 0,
@@ -752,10 +754,13 @@ def phase_1_upcoming_events():
                 continue
             fight["event_id"] = event_db_id
             fight["is_main_event"] = (f_idx == 1)
+            fight["is_active"] = True  # listed on the card now; re-activates a returning bout
             fight_id = upsert_fight(fight, tables)
             STATS["fights_upserted"] += 1
             if fight_id and rounds:
                 upsert_rounds(fight_id, rounds, tables)
+        # A cancelled bout just stops being listed. Retire it (card_sync.py).
+        STATS["bouts_retired"] += retire_dropped_bouts(supabase, tables["fights"], event_db_id, fight_urls)
 
 
 def phase_2_recent_completed_events():
@@ -812,6 +817,9 @@ def phase_2_recent_completed_events():
                 upsert_rounds(fight_id, rounds, tables)
             elif fight_id:
                 note_missing_rounds(fight, fight_url)
+        # A bout cancelled in fight week never gets a result and is not listed
+        # on the completed card. Retire it (card_sync.py).
+        STATS["bouts_retired"] += retire_dropped_bouts(supabase, tables["fights"], event_db_id, fight_urls)
 
 
 def phase_3_resolve_null_fighters():
@@ -997,6 +1005,7 @@ def main():
     print(f"  Events seen:              {STATS['events_seen']}")
     print(f"  Events upserted:          {STATS['events_upserted']}")
     print(f"  Fights upserted:          {STATS['fights_upserted']}")
+    print(f"  Dropped bouts retired:    {STATS['bouts_retired']}")
     print(f"  Fighters lazy-fetched:    {STATS['fighters_lazy_fetched']}")
     print(f"  Fighters refreshed:       {STATS['fighters_refreshed']}")
     print(f"  Null fighter ids resolved:{STATS['null_fighters_resolved']}")

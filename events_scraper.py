@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 from supabase import create_client, Client
 from challenge import make_session, get as challenge_get, is_challenge
 from promotion import tables_for, non_ufc_promotion, is_missing_table_error, UFC_TABLES, NON_UFC_TABLES
+from card_sync import retire_dropped_bouts
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
@@ -507,12 +508,18 @@ def main():
             fight["event_id"] = event_db_id
             # First fight on the card by convention is the main event (top of card on ufcstats)
             fight["is_main_event"] = (f_idx == 1)
+            if is_upcoming:
+                fight["is_active"] = True  # listed on the card now; re-activates a returning bout
             fight_id = upsert_fight(fight, tables)
             if fight_id and rounds:
                 upsert_rounds(fight_id, rounds, tables)
             fight_count += 1
             if fight_count % 25 == 0:
                 print(f"  ... {fight_count} fights processed total")
+
+        # A cancelled bout just stops being listed on the event page. Retire it
+        # rather than leave it on the site as a live fight (card_sync.py).
+        retire_dropped_bouts(supabase, tables["fights"], event_db_id, fight_urls)
 
     print(f"\n=== Done. {fight_count} fights saved. ===")
 
